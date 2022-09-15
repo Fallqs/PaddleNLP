@@ -48,7 +48,7 @@ def set_seed(args):
 
 def generate(texts, model, tokenizer, args):
     choice = ['global = ', 'var = ']
-    head = tokenizer(choice[0])['input_ids'] + [tokenizer.eos_token_id]
+    head = tokenizer(choice[1])['input_ids'] + [tokenizer.eos_token_id]
     for i, text in enumerate(texts):
         input_ids = head + tokenizer(text)['input_ids']
         if len(input_ids) == 0:
@@ -158,7 +158,7 @@ def do_train(args):
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     tokenizer = tokenizer_class(args.vocab_file, args.merge_file)
     #############################################################
-    # tokenizer = Sampler.encoding_tokenizer(tokenizer, args.max_seq_len + 1)
+    tokenizer = Sampler.encoding_tokenizer(tokenizer, args.max_seq_len + 1)
 
     test_texts = read_file(args.test_file)
 
@@ -188,10 +188,10 @@ def do_train(args):
             args.model_name_or_path,
             hidden_dropout_prob=args.hidden_dropout_prob,
             attention_probs_dropout_prob=args.attention_probs_dropout_prob)
-
+    
     print('vocab-size =', len(tokenizer))
     ################################################
-    # model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(len(tokenizer))
 
     # Create the critrion for the gpt model
     criterion = GPTPretrainingCriterion()
@@ -234,31 +234,31 @@ def do_train(args):
         grad_clip=clip,
         apply_decay_param_fun=lambda x: x in decay_params)
 
-    # for k, v in optimizer.state_dict().items():
-    #     if hasattr(v, 'shape'):
-    #         print(f'{k}: {v.shape}')
-    #     else:
-    #         print(f'{k}: {v}')
+    for k, v in optimizer.state_dict().items():
+        if hasattr(v, 'shape'):
+            print(f'{k}: {v.shape}')
+        else:
+            print(f'{k}: {v}')
 
     if args.use_amp:
         scaler = paddle.amp.GradScaler(init_loss_scaling=args.scale_loss)
 
-    if args.model_name_or_path not in pretrained_models_list:
-        logger.info("Try to load checkpoint from %s " % args.model_name_or_path)
-        opt_path = os.path.join(args.model_name_or_path, "model_state.pdopt")
-        if os.path.exists(opt_path):
-            opt_dict = paddle.load(opt_path)
-            # emb = opt_dict['embedding_0.w_0_moment1_0']
-            # shape = emb.shape[:]
-            # shape[0] = len(tokenizer) - shape[0]
-            # opt_dict['embedding_2.w_0_moment1_0'] = paddle.concat(x=[emb, paddle.rand(shape)])
-            # opt_dict['embedding_2.w_0_moment2_0'] = paddle.rand(opt_dict['embedding_2.w_0_moment1_0'].shape)
-
-            # logger.info(f"embedding shape = {opt_dict['embedding_0.w_0_moment1_0'].shape}")
-            optimizer.set_state_dict(opt_dict)
-        else:
-            logger.warning("No optimizer checkpoint file found in %s." %
-                           opt_path)
+    # if args.model_name_or_path not in pretrained_models_list:
+    #     logger.info("Try to load checkpoint from %s " % args.model_name_or_path)
+    #     opt_path = os.path.join(args.model_name_or_path, "model_state.pdopt")
+    #     if os.path.exists(opt_path):
+    #         opt_dict = paddle.load(opt_path)
+    #         # emb = opt_dict['embedding_0.w_0_moment1_0']
+    #         # shape = emb.shape[:]
+    #         # shape[0] = len(tokenizer) - shape[0]
+    #         # opt_dict['embedding_2.w_0_moment1_0'] = paddle.concat(x=[emb, paddle.rand(shape)])
+    #         # opt_dict['embedding_2.w_0_moment2_0'] = paddle.rand(opt_dict['embedding_2.w_0_moment1_0'].shape)
+            
+    #         # logger.info(f"embedding shape = {opt_dict['embedding_0.w_0_moment1_0'].shape}")
+    #         optimizer.set_state_dict(opt_dict)
+    #     else:
+    #         logger.warning("No optimizer checkpoint file found in %s." %
+    #                        opt_path)
 
     global_step = 0
     epoch = 0

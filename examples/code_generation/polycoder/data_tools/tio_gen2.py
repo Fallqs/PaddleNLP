@@ -4,11 +4,19 @@ from paddlenlp.transformers import GPTTokenizer
 import time
 import multiprocessing
 import argparse
+from io import StringIO
+import time
+import random
 
 
 def get_args():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title='data input/output')
+    group.add_argument('--seq_len',
+                       type=int,
+                       default=1024,
+                       required=False,
+                       help='Path to input JSON files.')
     group.add_argument('-i', '--input_path',
                        type=str,
                        required=True,
@@ -51,6 +59,64 @@ def get_args():
     return parser.parse_args()
 
 
+class _Sample(object):
+    def __init__(self, tokenizer, head: list, comma: int,
+                 seg_id: int = 0, note_id: int = 50257, size: int = 1025):
+        self.tk, self.seg_id, self.note_id, self.size = tokenizer, seg_id, note_id, size
+        self.head, self.body, self.comma = head, [], comma
+        self._head = head[:]
+        self.l = len(self.head) + 1
+        self.mp = dict()
+
+    def add_line(self, cont: str, vids: list):
+        cont = self.tk(cont)
+        j = 0
+        for i, v in enumerate(cont):
+            if v == self.note_id:
+                assert j < len(vids), f"{cont}"
+                cont[i], j = cont[i] + vids[j], j + 1
+        self.body.extend(cont)
+        self.l += len(cont)
+        return self.l >= self.size
+
+    def add_var(self, name: str, voft: int):
+        cont = self.tk(name + ':')
+        self.mp[self.note_id + voft] = self.tk(name)
+        # print(name, cont, self.note_id, self.comma)
+        self.head.extend(cont + [self.note_id + voft, self.comma])
+        self.l += len(cont) + 2
+        return self.l >= self.size
+
+    def collect(self):
+        self.head.append(self.seg_id)
+        msk = len(self.head)
+        self.head += self.body
+        if len(self.head) >= self.size:
+            return self.head[:self.size], msk
+        return self.head, msk
+    
+    def wasted(self):
+        return len(self.head) >= self.size >> 1
+
+    def clear(self):
+        self.head, self.body = self._head[:], []
+        self.l = len(self.head) + 1
+        self.mp = dict()
+    
+    def decode(self, ids: list[int]):
+        ret = []
+        for i in ids:
+            if i < self.note_id or i not in self.mp:
+                ret.append(i)
+            else:
+                ret.extend(self.mp[i])
+        # print(ret)
+        return ret
+
+    def __len__(self):
+        return self.l
+
+
 class Sampler(object):
     lang = {'False', 'await', 'else', 'import', 'pass',
             'None', 'break', 'except', 'in', 'raise',
@@ -79,19 +145,40 @@ class Sampler(object):
 
     nan, idt, num, ostr, anno = 0, 1, 2, 3, 4
     var, func = -1, -2
+    
+    IDT = 'cVf'
 
-    def __init__(self, cont, tokenizer, seg_id: int, seq_length: int = 1025):
+    def __init__(self, cont, tokenizer, seg_id: int = 0, seq_length: int = 1025,
+                 filter_rate: int = 0.5):
         # sp: item: [name: str, begin: int, end: int, type: int]
         self.cont, self.sp = '\n' + cont + '\n\n', []
         self.stat = self.nan
         # mp: {identifier: str -> [rank: int, first_appearance: int]}
         self.mp = dict()
         self.tokenizer, self.seg_id, self.seq_length = tokenizer, seg_id, seq_length
+        self.head, self.comma = tokenizer('var = '), tokenizer(',')[0]
         self.err = False
+        self.filter_rate = filter_rate
         try:
             self._load()
         except IndexError:
             self.err = True
+
+    @staticmethod
+    def encoding_tokenizer(tokenizer, seq_length: int = 1025, idt: str or None = None):
+        if idt is not None:
+            Sampler.IDT = idt
+        size = tokenizer.add_tokens([f'<{Sampler.IDT}{i}>' for i in range(seq_length >> 2)], True)
+        assert size == seq_length >> 2, 'Unaccepted IDT'
+        return tokenizer
+
+    @staticmethod
+    def decoding_tokenizer(tokenizer, seq_length: int = 1025, idt: str or None = None):
+        if idt is None:
+            idt = Sampler.IDT
+        size = tokenizer.add_tokens([idt + str(i) for i in range(seq_length >> 2)], False)
+        assert size == seq_length >> 2, 'Unaccepted IDT'
+        return tokenizer
 
     @staticmethod
     def builtin(idt: str) -> bool:
@@ -174,125 +261,88 @@ class Sampler(object):
         self.sp.append(
             ['', len(self.cont) + 10, len(self.cont) + 10, self.idt])
 
-    def _filter(self):
+    def _filter(self, encoding: bool = True):
         def chk(x) -> bool:
             t = x[0]
             return t not in self.ignore and not self.builtin(t)
 
         self.sp = list(filter(chk, self.sp))
+        vids, vidx = [u[0] for u in self.sp], [0] + [len(u) + 1 for u in self.cont.split('\n')]
+        j, pre = 0, 0
+        for i, ix in enumerate(vidx):
+            pre = ix = ix + pre
+            while self.sp[j][1] < ix:
+                it = self.sp[j]
+                if it[0] not in self.mp:
+                    self.mp[it[0]] = i
+                j += 1
+            vidx[i] = j
+
+        buf, lst, idt0 = StringIO(), 0, f'<{self.IDT}0>' if encoding else self.IDT + '0'
+        self.sp.pop()
         for it in self.sp:
-            if it[0] in self.mp:
-                continue
-            self.mp[it[0]] = it[1]
-
-    def _filter2(self):
-        seg, cnt, i = [], 0, 0
-        ctxt = self.cont.split('\n')
-        for line in ctxt:
-            cnt += len(line) + 1
-            seg.append(cnt)
-
-        vtxt = [list() for _ in range(len(seg))]
-        for name, begin, end, _ in self.sp:
-            if name in self.ignore or self.builtin(name):
-                continue
-            if not name:
-                break
-            while begin >= seg[i]:
-                i += 1
-            vtxt[i].append(name)
-            if name not in self.mp:
-                self.mp[name] = i
-
-        return ctxt, vtxt
+            buf.write(self.cont[lst:it[1]])
+            buf.write(idt0)
+            lst = it[2]
+        buf.write(self.cont[lst:])
+        buf.seek(0)
+        cont = buf.readlines()
+        buf.close()
+        return vids, vidx, cont
 
     def prompt(self, siz: int):
-        ctxt, vtxt = self._filter2()
-        vlen = np.zeros(len(ctxt))
-
-        head, comma = self.tokenizer('global = '), self.tokenizer(', ')
-        length = len(head) + 1
-        vbuf, vcnt, vmap = [], 0, dict()
-        cbuf = []
-        i = len(vlen)
-        for i in range(len(vlen) - 1, -1, -1):
-            vids = list(map(lambda y: self.tokenizer(y) + comma,
-                            filter(lambda x: x not in vmap, vtxt[i])))
-            cids = self.tokenizer('\n' + ctxt[i])
-            vl = sum(map(len, vids))
-            if length + vl - vlen[i] + len(vids) > siz:
+        vids, vidx, cont = self._filter(encoding=False)
+        j, vmp = 0, dict()
+        cur = _Sample(self.tokenizer, self.head, self.comma,
+                      self.seg_id, self.tokenizer(f'{self.IDT}0')[0],
+                      siz)
+        
+        for i, line in enumerate(cont[:-1]):
+            vl = vids[vidx[i]:vidx[i + 1]]
+            for name in vl:
+                if name not in vmp:
+                    cur.add_var(name, j)
+                    vmp[name], j = j, j + 1
+            vl = list(map(lambda v: vmp[v], vl))
+            if cur.add_line(line, vl):
                 break
-            length += vl - vlen[i]
-            cbuf.append(cids)
-            for j, v in enumerate(vtxt[i]):
-                if v not in vmap:
-                    ids = self.tokenizer(v) + comma
-                    vbuf.append([ids, (i, j)])
-                    vmap[v], vcnt = vcnt, vcnt + 1
-                    vlen[self.mp[v]] += len(ids)
-                    length += len(ids)
-                else:
-                    vbuf[vmap[v]][1] = (i, j)
-        globv = []
-        for k, idx in vmap.items():
-            if self.mp[k] < i:
-                globv.append(vbuf[idx])
-        globv.sort(key=lambda x: x[1])
-        for v in globv:
-            head += v[0]
-        idx = len(head)
-        for v in reversed(cbuf):
-            head += v
-        head[idx] = self.seg_id
-        return head
+        ids, _ = cur.collect()
+        return ids[:-1], cur.decode  #, ''.join(cont)
 
     def collect(self):
-        self._filter()
         ret = ([], [], [])  # item = ([ids], [i: loss_mask_head], [j: len])
         if self.err:
             return ret
-        header, comma = self.tokenizer('global = '), self.tokenizer(
-            ', ')  # 'global = ' || 'global = a,'
-        hl, cl = len(header), len(comma)
-        glob_l, cod_l = hl + 1, 0
-        start, cur, j = 0, 0, 0
-        buf_c, buf_g, buf_s = [], header[:], set()
+        vids, vidx, cont = self._filter()
 
-        for line in self.cont.split('\n'):
-            cur += len(line) + 1
-            ids = self.tokenizer(line + '\n')
-            cod_l += len(ids)
-            buf_c.extend(ids)
-            while self.sp[j][1] < cur:
-                name = self.sp[j][0]
-                if self.mp[name] < start and name not in buf_s:
-                    ids = self.tokenizer(name)
-                    glob_l += len(ids) + cl
-                    buf_g.extend(ids)
-                    buf_g.extend(comma)
-                    buf_s.add(name)
-                j += 1
-            if glob_l + cod_l > self.seq_length:
-                if glob_l < self.seq_length:
-                    buf_g.append(self.seg_id)
-                    tmp = buf_g + buf_c[:self.seq_length - glob_l]
-                    # try:
-                    #     assert len(tmp) == 1025
-                    # except AssertionError:
-                    #     print(len(tmp), len(buf_g), len(buf_c), glob_l, cod_l)
-                    #     print(line)
-                    ret[0].extend(tmp)
-                    ret[1].append(len(tmp))
-                    ret[2].append(glob_l)
-                glob_l, cod_l = hl + 1, 0
-                buf_c, buf_g, buf_s = [], header[:], set()
-                start = cur + 1
-        if cod_l > self.seq_length >> 1 and glob_l < self.seq_length:
-            buf_g.append(self.seg_id)
-            tmp = buf_g + buf_c
-            ret[0].extend(tmp)
-            ret[1].append(len(tmp))
-            ret[2].append(glob_l)
+        start, j, vmp = 0, 0, dict()
+        cur = _Sample(self.tokenizer, self.head, self.comma,
+                      self.seg_id, self.tokenizer(f'<{self.IDT}0>')[0],
+                      self.seq_length)
+        
+        def export(i=0):
+            nonlocal start, j, cur, vmp
+            # print(cur.head, cur.body)
+            if not cur.wasted():
+                ids, msk = cur.collect()
+                ret[0].extend(ids)
+                ret[1].append(len(ids))
+                ret[2].append(msk)
+            cur.clear()
+            start, j, vmp = i + 1, 0, dict()
+        
+        for i, line in enumerate(cont):
+            vl = vids[vidx[i]:vidx[i + 1]]
+            for name in vl:
+                if name not in vmp:
+                    if self.mp[name] < start or random.random() < self.filter_rate:
+                        cur.add_var(name, j)
+                    vmp[name], j = j, j + 1
+            vl = list(map(lambda v: vmp[v], vl))
+            if cur.add_line(line, vl):
+                export(i)
+        
+        export()
         return ret
 
 
@@ -322,10 +372,10 @@ def prompt_ids(content: str, tokenizer, size: int = 80):
     return Sampler(content, tk, tokenizer.eos_token_id).prompt(size)
 
 
-def test():
+def test(input: str = 'code_python'):
     t = time.perf_counter()
-    ids = np.load('input_ids_tio.npy')
-    npz = np.load('input_idx_tio.npz')
+    ids = np.load(input + '_ids_tio.npy')
+    npz = np.load(input + '_idx_tio.npz')
     idx, los = npz['idx'], npz['los']
     print('loaded:', time.perf_counter() - t)
 
@@ -335,22 +385,54 @@ def test():
     for i, p in enumerate(los):
         sample = ids[idx[i]:idx[i + 1]]
         # print(eos, sample[p-3:p+3])
-        assert sample[p - 1] == eos
+        assert sample[p - 1] == 0
+    
+    return ids, idx, los
+
+
+def test2(jl, tke, tkd):
+    def tk(x):
+        return tke(x)['input_ids']
+    
+    for i in range(3):
+        ids, dec, cont = Sampler(json.loads(jl.readline())['text'], tk, tke.eos_token_id).prompt(1025)
+        print('SOURCE:')
+        print(cont)
+        print('---------------------------\nTOKENIZE:')
+        print(tk(cont))
+        print(tkd.encode(cont))
+        print(tkd.tokenize(cont))
+        print('---------------------------\nDECODE:')
+        print(tkd.decode(tk(cont), spaces_between_special_tokens=False))
+        print('===========================')
 
 
 if __name__ == '__main__':
     args = get_args()
-    seq_len = 1024
+    seq_len = args.seq_len
     tk = GPTTokenizer(args.vocab_file, args.merge_file)
+    tk = Sampler.encoding_tokenizer(tk, seq_len + 1)
+    # tkd = Sampler.decoding_tokenizer(GPTTokenizer(args.vocab_file, args.merge_file, seq_len + 1))
+    print(len(tk))
     eos = tk.eos_token_id
 
+    # ids, idx, los = test('finetune10/code_python')
+    # for i in range(len(idx) - 1):
+    #     print(tk.decode(ids[idx[i]:idx[i + 1]]))
+    #     print('---------------------------------')
+
     jl = open(args.input_path, 'r', encoding='utf-8')
+    
+    # test2(jl, tk, tk)
+    
+    # jl.close()
+    
     t = time.perf_counter()
     with multiprocessing.Pool(multiprocessing.cpu_count() - 1) as p:
         ret = p.starmap(process, map(lambda x: (x, 'text', tk, seq_len), jl))
     print('generated, duration =', time.perf_counter() - t)
     jl.close()
-
+    
     t = time.perf_counter()
     ids, idx, los = [], [0], []
     for s, x, l in ret:

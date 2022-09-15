@@ -8,7 +8,7 @@ rm -rf $dir_name/$task_name/log
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 python -m paddle.distributed.launch \
     --gpus "0,1,2,3" \
-    --log_dir "$dir_name/$task_name/log"  tio_pretrain.py \
+    --log_dir "$dir_name/$task_name/log"  tio_pretrain2.py \
     --model_type "gpt" \
     --model_name_or_path "$mdl" \
     --input_dir "./$dir_name" \
