@@ -9,6 +9,11 @@ import argparse
 def get_args():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title='data input/output')
+    group.add_argument('--seq_len',
+                       type=int,
+                       default=1024,
+                       required=False,
+                       help='Path to input JSON files.')
     group.add_argument('-i', '--input_path',
                        type=str,
                        required=True,
@@ -340,7 +345,7 @@ def test():
 
 if __name__ == '__main__':
     args = get_args()
-    seq_len = 1024
+    seq_len = args.seq_len
     tk = GPTTokenizer(args.vocab_file, args.merge_file)
     eos = tk.eos_token_id
 

@@ -94,7 +94,7 @@ class _Sample(object):
         if len(self.head) >= self.size:
             return self.head[:self.size], msk
         return self.head, msk
-    
+
     def wasted(self):
         return len(self.head) >= self.size >> 1
 
@@ -102,7 +102,7 @@ class _Sample(object):
         self.head, self.body = self._head[:], []
         self.l = len(self.head) + 1
         self.mp = dict()
-    
+
     def decode(self, ids: list[int]):
         ret = []
         for i in ids:
@@ -145,7 +145,7 @@ class Sampler(object):
 
     nan, idt, num, ostr, anno = 0, 1, 2, 3, 4
     var, func = -1, -2
-    
+
     IDT = 'cVf'
 
     def __init__(self, cont, tokenizer, seg_id: int = 0, seq_length: int = 1025,
@@ -296,7 +296,7 @@ class Sampler(object):
         cur = _Sample(self.tokenizer, self.head, self.comma,
                       self.seg_id, self.tokenizer(f'{self.IDT}0')[0],
                       siz)
-        
+
         for i, line in enumerate(cont[:-1]):
             vl = vids[vidx[i]:vidx[i + 1]]
             for name in vl:
@@ -319,7 +319,7 @@ class Sampler(object):
         cur = _Sample(self.tokenizer, self.head, self.comma,
                       self.seg_id, self.tokenizer(f'<{self.IDT}0>')[0],
                       self.seq_length)
-        
+
         def export(i=0):
             nonlocal start, j, cur, vmp
             # print(cur.head, cur.body)
@@ -330,7 +330,7 @@ class Sampler(object):
                 ret[2].append(msk)
             cur.clear()
             start, j, vmp = i + 1, 0, dict()
-        
+
         for i, line in enumerate(cont):
             vl = vids[vidx[i]:vidx[i + 1]]
             for name in vl:
@@ -341,7 +341,7 @@ class Sampler(object):
             vl = list(map(lambda v: vmp[v], vl))
             if cur.add_line(line, vl):
                 export(i)
-        
+
         export()
         return ret
 
@@ -354,7 +354,7 @@ def process(jsonl, key: str, tokenizer, seq_length: int = 1024):
                    tokenizer.eos_token_id, seq_length + 1).collect()
 
 
-def prompt_ids(content: str, tokenizer, size: int = 80):
+def prompt_ids(content: str, tokenizer, size: int = 256):
     """
     For example:
     from tio_gen import prompt_ids
@@ -369,7 +369,7 @@ def prompt_ids(content: str, tokenizer, size: int = 80):
     def tk(x):
         return tokenizer(x)['input_ids']
 
-    return Sampler(content, tk, tokenizer.eos_token_id).prompt(size)
+    return Sampler(content, tk, tokenizer.eos_token_id, size).prompt(size)
 
 
 def test(input: str = 'code_python'):
@@ -386,14 +386,14 @@ def test(input: str = 'code_python'):
         sample = ids[idx[i]:idx[i + 1]]
         # print(eos, sample[p-3:p+3])
         assert sample[p - 1] == 0
-    
+
     return ids, idx, los
 
 
 def test2(jl, tke, tkd):
     def tk(x):
         return tke(x)['input_ids']
-    
+
     for i in range(3):
         ids, dec, cont = Sampler(json.loads(jl.readline())['text'], tk, tke.eos_token_id).prompt(1025)
         print('SOURCE:')
@@ -422,17 +422,17 @@ if __name__ == '__main__':
     #     print('---------------------------------')
 
     jl = open(args.input_path, 'r', encoding='utf-8')
-    
+
     # test2(jl, tk, tk)
-    
+
     # jl.close()
-    
+
     t = time.perf_counter()
     with multiprocessing.Pool(multiprocessing.cpu_count() - 1) as p:
         ret = p.starmap(process, map(lambda x: (x, 'text', tk, seq_len), jl))
     print('generated, duration =', time.perf_counter() - t)
     jl.close()
-    
+
     t = time.perf_counter()
     ids, idx, los = [], [0], []
     for s, x, l in ret:
